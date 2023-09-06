@@ -1,0 +1,7 @@
+Debug/
+Release/
+.vs/
+packages/
+steamaudio/
+*.dll
+*.pdb
