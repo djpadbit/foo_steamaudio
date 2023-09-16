@@ -1,5 +1,7 @@
 Debug/
 Release/
+Debug FB2K/
+Release FB2K/
 .vs/
 packages/
 steamaudio/

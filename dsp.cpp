@@ -1,9 +1,9 @@
 #include "stdafx.h"
 #include "resource.h"
+#include <helpers/DarkMode.h>
 #include <phonon.h>
 
 static void RunDSPConfigPopup(const dsp_preset & p_data,HWND p_parent,dsp_preset_edit_callback & p_callback);
-
 IPLContext global_ctx = nullptr;
 
 #define PATH_MAX_SIZE 1024
@@ -115,10 +115,11 @@ static inline void apply_matrix(IPLVector3 *vec, IPLMatrix4x4 *mat)
 	vec->z = vec->x*mat->elements[2][0]+vec->y*mat->elements[2][1]+vec->z*mat->elements[2][2]+mat->elements[2][3];
 }
 
-class dsp_steamaudio : public dsp_impl_base
+class dsp_steamaudio : public dsp_impl_base_t<dsp_v3>
 {
 public:
 	dsp_steamaudio(dsp_preset const & in) {
+		console::formatter() << "Steam Audio: Hello";
 		parse_preset(settings, in);
 		if (!setup_steamaudio_ctx())
 			console::formatter() << "Steam Audio: Failed setup";
@@ -127,6 +128,7 @@ public:
 	~dsp_steamaudio() {
 		cleanup_buffer();
 		cleanup_steamaudio_ctx();
+		console::formatter() << "Steam Audio: Goodbye";
 	}
 
 	static GUID g_get_guid() {
@@ -140,7 +142,6 @@ public:
 	bool on_chunk(audio_chunk * chunk,abort_callback &) {
 		// Perform any operations on the chunk here.
 		// The most simple DSPs can just alter the chunk in-place here and skip the following functions.
-
 		
 		// trivial DSP code: apply our gain to the audio data.
 		//chunk->scale( audio_math::gain_to_scale( m_gain ) );
@@ -148,7 +149,11 @@ public:
 		unsigned chan_cfg = chunk->get_channel_config();
 		unsigned samp_rate = chunk->get_sample_rate();
 		if (channels_cfg != chan_cfg || sample_rate != samp_rate) {
-			if (!reconfigure_steamaudio(chan_cfg, samp_rate)) {
+			unsigned chan_nb = audio_chunk::g_count_channels(chan_cfg);
+			channels_cfg = chan_cfg;
+			sample_rate = samp_rate;
+			channels_nb = chan_nb;
+			if (!reconfigure_steamaudio(true)) {
 				console::formatter() << "Steam Audio: Failed to reconfigure";
 				cleanup_steamaudio();
 			}
@@ -217,7 +222,25 @@ public:
 		return true;
 	}
 
-	static bool g_get_default_preset(dsp_preset & p_out) {
+	bool apply_preset(const dsp_preset &preset) {
+		// Parse the preset
+		dialogue_settings n_set;
+		parse_preset(n_set, preset);
+
+		// Figure out what important stuff changed
+		bool reconf_room = n_set.room_size != settings.room_size || n_set.cubemat != settings.cubemat;
+		bool reconf_hrtf = strcmp(n_set.hrtf_file,settings.hrtf_file) != 0;
+
+		console::formatter() << "Steam Audio: Apply new preset room:" << reconf_room << ", hrtf:" << reconf_hrtf;
+
+		// Apply the change to the current settings
+		settings = n_set;
+
+		// If needed reconfigure steamaudio
+		return reconfigure_steamaudio(false, reconf_room, reconf_hrtf);
+	}
+
+	static bool g_get_default_preset(dsp_preset &p_out) {
 		make_preset(default_settings, p_out);
 		return true;
 	}
@@ -228,13 +251,13 @@ public:
 
 	static bool g_have_config_popup() {return true;}
 
-	static void make_preset(dialogue_settings & set, dsp_preset & out) {
+	static void make_preset(dialogue_settings &set, dsp_preset &out) {
 		dsp_preset_builder builder;
 		builder << set.input_gain << set.direct_gain << set.ref_gain << set.room_size << set.cubemat << set.hrtf_file;
 		builder.finish(g_get_guid(), out);
 	}
 
-	static void parse_preset(dialogue_settings & set, const dsp_preset & in) {
+	static void parse_preset(dialogue_settings &set, const dsp_preset &in) {
 		try {
 			dsp_preset_parser parser(in);
 			parser >> set.input_gain >> set.direct_gain >> set.ref_gain >> set.room_size >> set.cubemat >> set.hrtf_file;
@@ -522,7 +545,7 @@ private:
 			return;
 
 		if (settings.input_gain != 0.0f)
-			chunk->scale(audio_math::gain_to_scale(settings.input_gain));
+			chunk->scale((audio_sample)audio_math::gain_to_scale(settings.input_gain));
 
 		iplAudioBufferDeinterleave(global_ctx, chunk->get_data(), &buffer_input);
 
@@ -556,7 +579,7 @@ private:
 			iplBinauralEffectApply(src->bin_effect, &bin_params, &buffer_mono, &buffer_stereo1);
 
 			if (settings.direct_gain != 0.0f)
-				scale_buffer(&buffer_stereo1, audio_math::gain_to_scale(settings.direct_gain));
+				scale_buffer(&buffer_stereo1, (audio_sample)audio_math::gain_to_scale(settings.direct_gain));
 
 			iplAudioBufferMix(global_ctx, &buffer_stereo1, &buffer_stereo2);
 
@@ -570,7 +593,7 @@ private:
 		iplAmbisonicsDecodeEffectApply(ambi_effect, &ambiParams, &buffer_ambi, &buffer_stereo1);
 
 		if (settings.ref_gain != 0.0f)
-			scale_buffer(&buffer_stereo1, audio_math::gain_to_scale(settings.ref_gain));
+			scale_buffer(&buffer_stereo1, (audio_sample)audio_math::gain_to_scale(settings.ref_gain));
 
 		iplAudioBufferMix(global_ctx, &buffer_stereo1, &buffer_stereo2);
 
@@ -654,85 +677,97 @@ private:
 	}
 
 	// Where the actual SA Setup occurs
-	bool reconfigure_steamaudio(unsigned chan_cfg, unsigned samp_rate) {
+	bool reconfigure_steamaudio(bool reconf_audio_cfg=true, bool reconf_room=false, bool reconf_hrtf=false) {
+		if (!reconf_audio_cfg && !reconf_room && !reconf_hrtf)
+			return true;
 		console::formatter() << "Steam Audio: Reconfiguring Audio";
-		unsigned chan_nb = audio_chunk::g_count_channels(chan_cfg);
-
-		cleanup_steamaudio();
-		setup_buffer(chan_nb);
-		channels_cfg = chan_cfg;
-		sample_rate = samp_rate;
-		channels_nb = chan_nb;
-		audio_cfg.frameSize = frame_size;
-		audio_cfg.samplingRate = samp_rate;
 
 		IPLSceneType sceneType = IPL_SCENETYPE_EMBREE;
 
-		embree_dev = nullptr;
+		if (reconf_audio_cfg) {
+			console::formatter() << "Steam Audio: Full Reconf";
+			reconf_hrtf = false;
+			reconf_room = false;
 
-		if (sceneType == IPL_SCENETYPE_EMBREE) {
-			IPLEmbreeDeviceSettings embreeSettings = {};
-			if (iplEmbreeDeviceCreate(global_ctx, &embreeSettings, &embree_dev) != IPL_STATUS_SUCCESS)
+			cleanup_steamaudio();
+			setup_buffer(channels_nb);
+			audio_cfg.frameSize = frame_size;
+			audio_cfg.samplingRate = sample_rate;
+
+			embree_dev = nullptr;
+
+			if (sceneType == IPL_SCENETYPE_EMBREE) {
+				IPLEmbreeDeviceSettings embreeSettings = {};
+				if (iplEmbreeDeviceCreate(global_ctx, &embreeSettings, &embree_dev) != IPL_STATUS_SUCCESS)
+					return false;
+			}
+
+			IPLSceneSettings sceneSettings = {};
+			sceneSettings.type = sceneType;
+			sceneSettings.embreeDevice = embree_dev;
+
+			if (iplSceneCreate(global_ctx, &sceneSettings, &scene) != IPL_STATUS_SUCCESS)
 				return false;
 		}
 
-		IPLSceneSettings sceneSettings = {};
-		sceneSettings.type = sceneType;
-		sceneSettings.embreeDevice = embree_dev;
-
-		if (iplSceneCreate(global_ctx, &sceneSettings, &scene) != IPL_STATUS_SUCCESS)
-			return false;
-
-		const int imeshsnb = 6;
-		float scale = settings.room_size;
-		float fagarr[][6] = {
-			{0,-2.15,0,2*scale,1,2*scale},
-			{0,2.15,0,2*scale,1,2*scale},
-			{1*scale,0,0,1,2*scale,2*scale},
-			{-1*scale,0,0,1,2*scale,2*scale},
-			{0,0,1*scale,2*scale,2*scale,1},
-			{0,0,-1*scale,2*scale,2*scale,1}
-		};
-		//IPLhandle imeshs[imeshsnb];
-		IPLVector3 verts[imeshsnb*nbverts];
-		IPLTriangle tris[imeshsnb*nbtris];
-		IPLint32 mats[imeshsnb*nbtris];
-		for (int i=0;i<imeshsnb;i++) {
-			IPLMatrix4x4 mat = {};
-			make_transform(&mat,fagarr[i][0],fagarr[i][1],fagarr[i][2],fagarr[i][3],fagarr[i][4],fagarr[i][5]);
-			for (int i2=0;i2<nbverts;i2++) {
-				verts[(i*nbverts)+i2].x = cubeverts[i2].x;
-				verts[(i*nbverts)+i2].y = cubeverts[i2].y;
-				verts[(i*nbverts)+i2].z = cubeverts[i2].z;
-				apply_matrix(&verts[(i*nbverts)+i2],&mat);
-			}
-			for (int i2=0;i2<nbtris;i2++) {
-				tris[(i*nbtris)+i2].indices[0] = (i*nbverts)+cubetris[i2].indices[0];
-				tris[(i*nbtris)+i2].indices[1] = (i*nbverts)+cubetris[i2].indices[1];
-				tris[(i*nbtris)+i2].indices[2] = (i*nbverts)+cubetris[i2].indices[2];
-				mats[(i*nbtris)+i2] = settings.cubemat;
-			}
-			//iplCreateInstancedMesh(scene, cube_scene, mat, &imeshs[i]);
-			//iplAddInstancedMesh(scene, imeshs[i]);
+		if (reconf_room && static_mesh) {
+			iplStaticMeshRemove(static_mesh, scene);
+			iplSceneCommit(scene);
+			iplStaticMeshRelease(&static_mesh);
 		}
 
-		//printf("Verts:%i Tris:%i\n",sizeof(verts)/sizeof(IPLVector3),sizeof(tris)/sizeof(IPLTriangle));
+		if (reconf_audio_cfg || reconf_room) {
+			const int imeshsnb = 6;
+			float scale = settings.room_size;
+			float fagarr[][6] = {
+				{0,-2.15,0,2*scale,1,2*scale},
+				{0,2.15,0,2*scale,1,2*scale},
+				{1*scale,0,0,1,2*scale,2*scale},
+				{-1*scale,0,0,1,2*scale,2*scale},
+				{0,0,1*scale,2*scale,2*scale,1},
+				{0,0,-1*scale,2*scale,2*scale,1}
+			};
+			//IPLhandle imeshs[imeshsnb];
+			IPLVector3 verts[imeshsnb*nbverts];
+			IPLTriangle tris[imeshsnb*nbtris];
+			IPLint32 mats[imeshsnb*nbtris];
+			for (int i=0;i<imeshsnb;i++) {
+				IPLMatrix4x4 mat = {};
+				make_transform(&mat,fagarr[i][0],fagarr[i][1],fagarr[i][2],fagarr[i][3],fagarr[i][4],fagarr[i][5]);
+				for (int i2=0;i2<nbverts;i2++) {
+					verts[(i*nbverts)+i2].x = cubeverts[i2].x;
+					verts[(i*nbverts)+i2].y = cubeverts[i2].y;
+					verts[(i*nbverts)+i2].z = cubeverts[i2].z;
+					apply_matrix(&verts[(i*nbverts)+i2],&mat);
+				}
+				for (int i2=0;i2<nbtris;i2++) {
+					tris[(i*nbtris)+i2].indices[0] = (i*nbverts)+cubetris[i2].indices[0];
+					tris[(i*nbtris)+i2].indices[1] = (i*nbverts)+cubetris[i2].indices[1];
+					tris[(i*nbtris)+i2].indices[2] = (i*nbverts)+cubetris[i2].indices[2];
+					mats[(i*nbtris)+i2] = settings.cubemat;
+				}
+				//iplCreateInstancedMesh(scene, cube_scene, mat, &imeshs[i]);
+				//iplAddInstancedMesh(scene, imeshs[i]);
+			}
 
-		IPLStaticMeshSettings staticMeshSettings = {};
-		staticMeshSettings.numVertices = nbverts * imeshsnb;
-		staticMeshSettings.numTriangles = nbtris * imeshsnb;
-		staticMeshSettings.numMaterials = nummats;
-		staticMeshSettings.vertices = verts;
-		staticMeshSettings.triangles = tris;
-		staticMeshSettings.materialIndices = mats;
-		staticMeshSettings.materials = materials;
+			//printf("Verts:%i Tris:%i\n",sizeof(verts)/sizeof(IPLVector3),sizeof(tris)/sizeof(IPLTriangle));
 
-		if (iplStaticMeshCreate(scene, &staticMeshSettings, &static_mesh) != IPL_STATUS_SUCCESS)
-			return false;
+			IPLStaticMeshSettings staticMeshSettings = {};
+			staticMeshSettings.numVertices = nbverts * imeshsnb;
+			staticMeshSettings.numTriangles = nbtris * imeshsnb;
+			staticMeshSettings.numMaterials = nummats;
+			staticMeshSettings.vertices = verts;
+			staticMeshSettings.triangles = tris;
+			staticMeshSettings.materialIndices = mats;
+			staticMeshSettings.materials = materials;
 
-		iplStaticMeshAdd(static_mesh, scene);
-		iplSceneCommit(scene);
-		//iplSceneSaveOBJ(scene,"C:\\Users\\Pablo\\AppData\\Roaming\\foobar2000\\user-components\\foo_steamaudio\\fuck.obj");
+			if (iplStaticMeshCreate(scene, &staticMeshSettings, &static_mesh) != IPL_STATUS_SUCCESS)
+				return false;
+
+			iplStaticMeshAdd(static_mesh, scene);
+			iplSceneCommit(scene);
+			//iplSceneSaveOBJ(scene,"C:\\Users\\Pablo\\AppData\\Roaming\\foobar2000\\user-components\\foo_steamaudio\\fuck.obj");
+		}
 
 		int nbRays = 4096;
 		int nbBounces = 16;
@@ -741,105 +776,128 @@ private:
 		int ambiChans = (ambiOrder + 1) * (ambiOrder + 1);
 		float irDuration = 2.0f;
 
-		sim_flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+		if (reconf_audio_cfg) {
+			sim_flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
 
-		simulation_settings.flags = sim_flags;
-		simulation_settings.sceneType = sceneType;
-		simulation_settings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-		simulation_settings.maxNumOcclusionSamples = nbOccSamples;
-		simulation_settings.maxNumRays = nbRays;
-		simulation_settings.numDiffuseSamples = 32;
-		simulation_settings.maxDuration = irDuration;
-		simulation_settings.maxOrder = ambiOrder;
-		simulation_settings.maxNumSources = audio_chunk::defined_channel_count;
-		simulation_settings.numThreads = 24;
-		simulation_settings.samplingRate = sample_rate;
-		simulation_settings.frameSize = frame_size;
+			simulation_settings.flags = sim_flags;
+			simulation_settings.sceneType = sceneType;
+			simulation_settings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+			simulation_settings.maxNumOcclusionSamples = nbOccSamples;
+			simulation_settings.maxNumRays = nbRays;
+			simulation_settings.numDiffuseSamples = 32;
+			simulation_settings.maxDuration = irDuration;
+			simulation_settings.maxOrder = ambiOrder;
+			simulation_settings.maxNumSources = audio_chunk::defined_channel_count;
+			simulation_settings.numThreads = 24;
+			simulation_settings.samplingRate = sample_rate;
+			simulation_settings.frameSize = frame_size;
 
-		if (iplSimulatorCreate(global_ctx, &simulation_settings, &simulator) != IPL_STATUS_SUCCESS)
-			return false;
+			if (iplSimulatorCreate(global_ctx, &simulation_settings, &simulator) != IPL_STATUS_SUCCESS)
+				return false;
 
-		iplSimulatorSetScene(simulator, scene);
-		iplSimulatorCommit(simulator);
-
-		IPLHRTFSettings hrtf_params = { IPL_HRTFTYPE_DEFAULT, NULL, NULL, 0, 1.0f };
-
-		if (settings.hrtf_file[0] != '\x00') {
-			hrtf_params.type = IPL_HRTFTYPE_SOFA;
-			hrtf_params.sofaFileName = (const char*)&settings.hrtf_file;
+			iplSimulatorSetScene(simulator, scene);
+			iplSimulatorCommit(simulator);
 		}
 
-		if (iplHRTFCreate(global_ctx, &audio_cfg, &hrtf_params, &hrtf) != IPL_STATUS_SUCCESS)
-			return false;
+		if (reconf_hrtf) {
+			cleanup_sources();
+			if (ambi_effect)
+				iplAmbisonicsDecodeEffectRelease(&ambi_effect);
+			if (hrtf)
+				iplHRTFRelease(&hrtf);
+		}
+
+		if (reconf_audio_cfg || reconf_hrtf) {
+			IPLHRTFSettings hrtf_params = { IPL_HRTFTYPE_DEFAULT, NULL, NULL, 0, 1.0f };
+
+			if (settings.hrtf_file[0] != '\x00') {
+				hrtf_params.type = IPL_HRTFTYPE_SOFA;
+				hrtf_params.sofaFileName = (const char*)&settings.hrtf_file;
+			}
+
+			if (iplHRTFCreate(global_ctx, &audio_cfg, &hrtf_params, &hrtf) != IPL_STATUS_SUCCESS)
+				return false;
+		}
 
 		ref_settings.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
 		ref_settings.irSize = static_cast<IPLint32>(simulation_settings.maxDuration * sample_rate);
 		ref_settings.numChannels = ambiChans;
 
-		if (!setup_sources())
-			return false;
+		if (reconf_audio_cfg || reconf_hrtf) {
+			if (!setup_sources())
+				return false;
+		}
 
-		IPLAmbisonicsDecodeEffectSettings ambi_settings = {};
-		ambi_settings.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
-		ambi_settings.maxOrder = ambiOrder;
-		ambi_settings.hrtf = hrtf;
+		if (reconf_audio_cfg || reconf_hrtf) {
+			IPLAmbisonicsDecodeEffectSettings ambi_settings = {};
+			ambi_settings.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
+			ambi_settings.maxOrder = ambiOrder;
+			ambi_settings.hrtf = hrtf;
 
-		if (iplAmbisonicsDecodeEffectCreate(global_ctx, &audio_cfg, &ambi_settings, &ambi_effect) != IPL_STATUS_SUCCESS)
-			return false;
+			if (iplAmbisonicsDecodeEffectCreate(global_ctx, &audio_cfg, &ambi_settings, &ambi_effect) != IPL_STATUS_SUCCESS)
+				return false;
+		}
 
-		if (iplReflectionMixerCreate(global_ctx, &audio_cfg, &ref_settings, &ref_mixer) != IPL_STATUS_SUCCESS)
-			return false;
+		if (reconf_audio_cfg) {
+			if (iplReflectionMixerCreate(global_ctx, &audio_cfg, &ref_settings, &ref_mixer) != IPL_STATUS_SUCCESS)
+				return false;
 
-		if (iplAudioBufferAllocate(global_ctx, channels_nb, frame_size, &buffer_input) != IPL_STATUS_SUCCESS)
-			return false;
-		if (iplAudioBufferAllocate(global_ctx, 1, frame_size, &buffer_mono) != IPL_STATUS_SUCCESS)
-			return false;
-		if (iplAudioBufferAllocate(global_ctx, 2, frame_size, &buffer_stereo1) != IPL_STATUS_SUCCESS)
-			return false;
-		if (iplAudioBufferAllocate(global_ctx, 2, frame_size, &buffer_stereo2) != IPL_STATUS_SUCCESS)
-			return false;
-		if (iplAudioBufferAllocate(global_ctx, ambiChans, frame_size, &buffer_ambi) != IPL_STATUS_SUCCESS)
-			return false;
+			if (iplAudioBufferAllocate(global_ctx, channels_nb, frame_size, &buffer_input) != IPL_STATUS_SUCCESS)
+				return false;
+			if (iplAudioBufferAllocate(global_ctx, 1, frame_size, &buffer_mono) != IPL_STATUS_SUCCESS)
+				return false;
+			if (iplAudioBufferAllocate(global_ctx, 2, frame_size, &buffer_stereo1) != IPL_STATUS_SUCCESS)
+				return false;
+			if (iplAudioBufferAllocate(global_ctx, 2, frame_size, &buffer_stereo2) != IPL_STATUS_SUCCESS)
+				return false;
+			if (iplAudioBufferAllocate(global_ctx, ambiChans, frame_size, &buffer_ambi) != IPL_STATUS_SUCCESS)
+				return false;
+		}
 
-		listener_coords.origin = {0.0f, 0.0f, 0.0f};
-		listener_coords.up = {0.0f, 1.0f, 0.0f};
-		listener_coords.right = {1.0f, 0.0f, 0.0f};
-		listener_coords.ahead = {0.0f, 0.0f, -1.0f};
+		if (reconf_audio_cfg || reconf_hrtf) {
+			listener_coords.origin = {0.0f, 0.0f, 0.0f};
+			listener_coords.up = {0.0f, 1.0f, 0.0f};
+			listener_coords.right = {1.0f, 0.0f, 0.0f};
+			listener_coords.ahead = {0.0f, 0.0f, -1.0f};
 
-		IPLSimulationSharedInputs sharedInputs = {};
-		sharedInputs.listener = listener_coords;
-		sharedInputs.numRays = nbRays;
-		sharedInputs.numBounces = nbBounces;
-		sharedInputs.duration = irDuration;
-		sharedInputs.order = ambiOrder;
-		sharedInputs.irradianceMinDistance = 1.0f;
-		iplSimulatorSetSharedInputs(simulator, sim_flags, &sharedInputs);
+			IPLSimulationSharedInputs sharedInputs = {};
+			sharedInputs.listener = listener_coords;
+			sharedInputs.numRays = nbRays;
+			sharedInputs.numBounces = nbBounces;
+			sharedInputs.duration = irDuration;
+			sharedInputs.order = ambiOrder;
+			sharedInputs.irradianceMinDistance = 1.0f;
+			iplSimulatorSetSharedInputs(simulator, sim_flags, &sharedInputs);
 
-		iplSimulatorCommit(simulator);
+			iplSimulatorCommit(simulator);
 
-		source_inputs.flags = sim_flags;
-		source_inputs.directFlags = static_cast<IPLDirectSimulationFlags>(IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
-									IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION |
-									IPL_DIRECTSIMULATIONFLAGS_DIRECTIVITY |
-									IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
-									IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
-		source_inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
-		source_inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
-		source_inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
-		source_inputs.occlusionRadius = 1.0f;
-		source_inputs.numOcclusionSamples = nbOccSamples;
+			source_inputs.flags = sim_flags;
+			source_inputs.directFlags = static_cast<IPLDirectSimulationFlags>(IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+										IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION |
+										IPL_DIRECTSIMULATIONFLAGS_DIRECTIVITY |
+										IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
+										IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+			source_inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
+			source_inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+			source_inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
+			source_inputs.occlusionRadius = 1.0f;
+			source_inputs.numOcclusionSamples = nbOccSamples;
+		}
 
-		run_simulation();
+		if (reconf_audio_cfg || reconf_room || reconf_hrtf)
+			run_simulation();
 
-		bin_params.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
-		bin_params.spatialBlend = 1.0f;
-		bin_params.hrtf = hrtf;
+		if (reconf_audio_cfg || reconf_hrtf) {
+			bin_params.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+			bin_params.spatialBlend = 1.0f;
+			bin_params.hrtf = hrtf;
 
-		dir_apply_flags = static_cast<IPLDirectEffectFlags>(IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-							IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-							IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY |
-							IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-							IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+			dir_apply_flags = static_cast<IPLDirectEffectFlags>(IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+								IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+								IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY |
+								IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+								IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+		}
 
 		return true;
 	}
@@ -876,7 +934,7 @@ private:
 	}
 
 	static void ipl_log(IPLLogLevel lvl, const char* msg) {
-		console::formatter() << "Steam Audio: " << msg;
+		console::formatter() << "Steam Audio: " << pfc::string(msg).replace("\n","");
 	}
 
 	// Sets up the SA Context
@@ -940,6 +998,7 @@ private:
 	dialogue_settings settings;
 
 	BOOL OnInitDialog(CWindow, LPARAM) {
+		m_dark.AddDialogWithControls(m_hWnd);
 		m_slider_input = GetDlgItem(IDC_SLIDER);
 		m_slider_direct = GetDlgItem(IDC_SLIDER2);
 		m_slider_ref = GetDlgItem(IDC_SLIDER3);
@@ -1059,13 +1118,13 @@ private:
 	const dsp_preset & m_initData; // modal dialog so we can reference this caller-owned object.
 	dsp_preset_edit_callback & m_callback;
 
-	bool dirty;
 	CComboBox m_combo_mat;
 	CEdit m_edit_hrtf_file;
 	CTrackBarCtrl m_slider_input;
 	CTrackBarCtrl m_slider_direct;
 	CTrackBarCtrl m_slider_ref;
 	CTrackBarCtrl m_slider_rsize;
+	fb2k::CDarkModeHooks m_dark;
 };
 
 static void RunDSPConfigPopup(const dsp_preset & p_data,HWND p_parent,dsp_preset_edit_callback & p_callback) {
